@@ -2,3 +2,7 @@
 *.swp
 *.tmp
 *.bak
+certificate
+private_key
+*.key
+*.pem
