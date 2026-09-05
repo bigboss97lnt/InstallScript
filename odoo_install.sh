@@ -184,6 +184,7 @@ if is_true "$INSTALL_WKHTMLTOPDF"; then
     WKHTMLTOPDF_PACKAGE="wkhtmltox_${WKHTMLTOPDF_VERSION}.jammy_${ARCH}.deb"
     WKHTMLTOPDF_TEMP="$(mktemp --suffix=.deb)"
     TEMP_FILES+=("$WKHTMLTOPDF_TEMP")
+    chmod 0644 "$WKHTMLTOPDF_TEMP"
     curl -fL --retry 3 --output "$WKHTMLTOPDF_TEMP" \
         "${WKHTMLTOPDF_BASE_URL}/${WKHTMLTOPDF_PACKAGE}"
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$WKHTMLTOPDF_TEMP"
