@@ -1,450 +1,448 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -Eeuo pipefail
+
 ################################################################################
-# Script for installing Odoo on Ubuntu 16.04, 18.04, 20.04 and 22.04 (could be used for other version too)
-# Author: Yenthe Van Ginneken
-#-------------------------------------------------------------------------------
-# This script will install Odoo on your Ubuntu server. It can install multiple Odoo instances
-# in one Ubuntu because of the different xmlrpc_ports
-#-------------------------------------------------------------------------------
-# Make a new file:
-# sudo nano odoo-install.sh
-# Place this content in it and then make the file executable:
-# sudo chmod +x odoo-install.sh
-# Execute the script to install Odoo:
-# ./odoo-install
+# Install Odoo 18 Enterprise on Ubuntu 22.04/24.04 with PostgreSQL 16,
+# wkhtmltopdf 0.12.6.1 (patched Qt), Nginx, and Cloudflare Origin SSL.
+# Based on Yenthe Van Ginneken's InstallScript and bigboss97lnt's Odoo 16 fixes.
 ################################################################################
 
+# Odoo
 OE_USER="odoo"
-OE_HOME="/$OE_USER"
-OE_HOME_EXT="/$OE_USER/${OE_USER}-server"
-# The default port where this Odoo instance will run under (provided you use the command -c in the terminal)
-# Set to true if you want to install it, false if you don't need it or have it already installed.
-INSTALL_WKHTMLTOPDF="True"
-# Set the default Odoo port (you still have to use -c /etc/odoo-server.conf for example to use this.)
+OE_HOME="/${OE_USER}"
+OE_HOME_EXT="${OE_HOME}/${OE_USER}-server"
+OE_VERSION="18.0"
 OE_PORT="8069"
-# Choose the Odoo version which you want to install. For example: 16.0, 15.0, 14.0 or saas-22. When using 'master' the master version will be installed.
-# IMPORTANT! This script contains extra libraries that are specifically needed for Odoo 16.0
-OE_VERSION="16.0"
-# Set this to True if you want to install the Odoo enterprise version!
-IS_ENTERPRISE="False"
-# Installs postgreSQL V14 instead of defaults (e.g V12 for Ubuntu 20/22) - this improves performance
-INSTALL_POSTGRESQL_FOURTEEN="True"
-# Set this to True if you want to install Nginx!
-INSTALL_NGINX="False"
-# Set the superadmin password - if GENERATE_RANDOM_PASSWORD is set to "True" we will automatically generate a random password, otherwise we use this one
-OE_SUPERADMIN="admin"
-# Set to "True" to generate a random password, "False" to use the variable in OE_SUPERADMIN
-GENERATE_RANDOM_PASSWORD="True"
+GEVENT_PORT="8072"
 OE_CONFIG="${OE_USER}-server"
-# Set the website name
-WEBSITE_NAME="_"
-# Set the default Odoo longpolling port (you still have to use -c /etc/odoo-server.conf for example to use this.)
-LONGPOLLING_PORT="8072"
-# Set to "True" to install the supplied Cloudflare Origin Certificate.
+OE_SUPERADMIN="admin"
+GENERATE_RANDOM_PASSWORD="True"
+WORKERS="2"
+
+# Components requested for this installation
+IS_ENTERPRISE="True"
+INSTALL_POSTGRESQL_SIXTEEN="True"
+INSTALL_WKHTMLTOPDF="True"
+INSTALL_NGINX="True"
 ENABLE_SSL="True"
-# Cloudflare Origin Certificate files supplied alongside this script.
+
+# Enterprise access requires an authorized GitHub account/PAT or SSH setup.
+ENTERPRISE_REPO="https://github.com/odoo/enterprise.git"
+
+# Nginx / Cloudflare. Change WEBSITE_NAME before running the script.
+WEBSITE_NAME="odoo.example.com"
 CF_CERT_SOURCE="/root/certificate"
 CF_KEY_SOURCE="/root/private_key"
+REMOVE_CF_SOURCE_FILES="True"
 NGINX_SSL_DIR="/etc/nginx/ssl/${WEBSITE_NAME}"
 CF_CERT_PATH="${NGINX_SSL_DIR}/origin.crt"
 CF_KEY_PATH="${NGINX_SSL_DIR}/origin.key"
-##
-###  WKHTMLTOPDF download links
-## === Ubuntu Trusty x64 & x32 === (for other distributions please replace these two links,
-## in order to have correct version of wkhtmltopdf installed, for a danger note refer to
-## https://github.com/odoo/odoo/wiki/Wkhtmltopdf ):
-## https://www.odoo.com/documentation/16.0/administration/install.html
 
-WKHTMLTOX_URL="https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-3/wkhtmltox_0.12.6.1-3.jammy_amd64.deb"
+# wkhtmltopdf 0.12.6.1-3 is the patched-Qt release linked by Odoo 18 docs.
+WKHTMLTOPDF_VERSION="0.12.6.1-3"
+WKHTMLTOPDF_BASE_URL="https://github.com/wkhtmltopdf/packaging/releases/download/${WKHTMLTOPDF_VERSION}"
 
-if [[ "$(lsb_release -is)" != "Ubuntu" || "$(lsb_release -rs)" != "22.04" ]]; then
-    echo "ERROR: This installer targets Ubuntu 22.04 (Jammy)." >&2
+TEMP_FILES=()
+cleanup() {
+    local file
+    for file in "${TEMP_FILES[@]:-}"; do
+        [ -n "$file" ] && rm -f "$file"
+    done
+}
+trap cleanup EXIT
+
+fail() {
+    echo "ERROR: $*" >&2
     exit 1
-fi
-if [[ "$(dpkg --print-architecture)" != "amd64" ]]; then
-    echo "ERROR: The configured wkhtmltopdf package requires amd64." >&2
-    exit 1
-fi
+}
 
-#--------------------------------------------------
-# Update Server
-#--------------------------------------------------
-echo -e "\n---- Update Server ----"
-# universe package is for Ubuntu 18.x
-sudo add-apt-repository universe
+is_true() {
+    [ "${1:-False}" = "True" ]
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || fail "Required command not found: $1"
+}
+
+echo_section() {
+    printf '\n---- %s ----\n' "$1"
+}
+
+#-------------------------------------------------------------------------------
+# Preflight
+#-------------------------------------------------------------------------------
+require_command sudo
+require_command dpkg
+
+sudo -v
+
+# shellcheck disable=SC1091
+source /etc/os-release
+UBUNTU_RELEASE="${VERSION_ID:-}"
+UBUNTU_CODENAME="${VERSION_CODENAME:-}"
+ARCH="$(dpkg --print-architecture)"
+
+[ "${ID:-}" = "ubuntu" ] || fail "This installer supports Ubuntu only."
+case "$UBUNTU_RELEASE" in
+    22.04|24.04) ;;
+    *) fail "This installer supports Ubuntu 22.04 or 24.04; found ${UBUNTU_RELEASE}." ;;
+esac
+case "$ARCH" in
+    amd64|arm64) ;;
+    *) fail "wkhtmltopdf ${WKHTMLTOPDF_VERSION} is configured for amd64/arm64; found ${ARCH}." ;;
+esac
+
+if is_true "$INSTALL_NGINX"; then
+    [ "$WEBSITE_NAME" != "odoo.example.com" ] && [ "$WEBSITE_NAME" != "_" ] \
+        || fail "Set WEBSITE_NAME to the Cloudflare-proxied hostname before running."
+fi
+if is_true "$INSTALL_NGINX" && is_true "$ENABLE_SSL"; then
+    [ -s "$CF_CERT_SOURCE" ] || fail "Cloudflare Origin Certificate not found: ${CF_CERT_SOURCE}"
+    [ -s "$CF_KEY_SOURCE" ] || fail "Cloudflare Origin private key not found: ${CF_KEY_SOURCE}"
+fi
+[ ! -e "$OE_HOME_EXT" ] || fail "Odoo target already exists: ${OE_HOME_EXT}"
+
+#-------------------------------------------------------------------------------
+# Base packages and PostgreSQL
+#-------------------------------------------------------------------------------
+echo_section "Updating server and installing base dependencies"
 sudo apt-get update
-sudo apt-get upgrade -y
-sudo apt-get install -y ca-certificates curl gnupg lsb-release openssl libpq-dev
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    ca-certificates curl git gnupg lsb-release software-properties-common
+sudo add-apt-repository -y universe
+sudo apt-get update
+sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    build-essential ca-certificates curl git gnupg libffi-dev libjpeg-dev \
+    libldap2-dev libpq-dev libsasl2-dev libssl-dev libxslt1-dev libzip-dev \
+    lsb-release nodejs npm openssl python3 python3-cffi python3-dev python3-pip \
+    python3-venv python3-wheel wget xfonts-75dpi xfonts-base zlib1g-dev
 
-#--------------------------------------------------
-# Install PostgreSQL Server
-#--------------------------------------------------
-echo -e "\n---- Install PostgreSQL Server ----"
-if [ $INSTALL_POSTGRESQL_FOURTEEN = "True" ]; then
-    echo -e "\n---- Installing postgreSQL V14 due to the user it's choise ----"
+echo_section "Installing PostgreSQL"
+if is_true "$INSTALL_POSTGRESQL_SIXTEEN"; then
     sudo install -d -m 0755 /etc/apt/keyrings
-    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor --yes -o /etc/apt/keyrings/postgresql.gpg
-    echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        | sudo gpg --dearmor --yes -o /etc/apt/keyrings/postgresql.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt ${UBUNTU_CODENAME}-pgdg main" \
+        | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
     sudo apt-get update
-    sudo apt-get install -y postgresql-14
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-16 postgresql-client-16
+    if is_true "$IS_ENTERPRISE"; then
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-16-pgvector
+        sudo systemctl start postgresql
+        POSTGRES_READY="False"
+        for _attempt in {1..30}; do
+            if sudo -u postgres pg_isready >/dev/null 2>&1; then
+                POSTGRES_READY="True"
+                break
+            fi
+            sleep 1
+        done
+        is_true "$POSTGRES_READY" || fail "PostgreSQL did not become ready within 30 seconds."
+        sudo -u postgres psql -v ON_ERROR_STOP=1 -d template1 \
+            -c 'CREATE EXTENSION IF NOT EXISTS vector;'
+    fi
 else
-    echo -e "\n---- Installing the default postgreSQL version based on Linux version ----"
-    sudo apt-get install postgresql postgresql-server-dev-all -y
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql postgresql-client
 fi
 
+echo_section "Creating the Odoo PostgreSQL role"
+# Odoo needs CREATEDB, but never PostgreSQL SUPERUSER privileges.
+if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${OE_USER}'" | grep -q 1; then
+    sudo -u postgres createuser -d -R -S "$OE_USER"
+fi
 
-echo -e "\n---- Creating the ODOO PostgreSQL User  ----"
-sudo su - postgres -c "createuser -s $OE_USER" 2> /dev/null || true
-
-#--------------------------------------------------
-# Install Dependencies
-#--------------------------------------------------
-echo -e "\n--- Installing Python 3 + pip3 --"
-sudo apt-get install -y python3 python3-pip python3-venv git python3-cffi build-essential wget python3-dev python3-wheel libxslt1-dev libzip-dev libldap2-dev libsasl2-dev python3-setuptools node-less libpng-dev libjpeg-dev libffi-dev libssl-dev zlib1g-dev
-
-echo -e "\n---- Installing nodeJS NPM and rtlcss for LTR support ----"
-sudo apt-get install nodejs npm -y
+#-------------------------------------------------------------------------------
+# wkhtmltopdf and Node tooling
+#-------------------------------------------------------------------------------
+echo_section "Installing Node tooling"
 sudo npm install -g rtlcss
 
-#--------------------------------------------------
-# Install Wkhtmltopdf if needed
-#--------------------------------------------------
-if [ $INSTALL_WKHTMLTOPDF = "True" ]; then
-  echo -e "\n---- Install wkhtmltopdf 0.12.6.1 (patched Qt) ----"
-  wget -q --show-progress "$WKHTMLTOX_URL" -O /tmp/wkhtmltox.deb
-  sudo apt-get install -y /tmp/wkhtmltox.deb
-  rm -f /tmp/wkhtmltox.deb
-  wkhtmltopdf --version | grep -F "wkhtmltopdf 0.12.6.1 (with patched qt)"
-else
-  echo "Wkhtmltopdf isn't installed due to the choice of the user!"
+if is_true "$INSTALL_WKHTMLTOPDF"; then
+    echo_section "Installing wkhtmltopdf 0.12.6.1 (patched Qt)"
+    WKHTMLTOPDF_PACKAGE="wkhtmltox_${WKHTMLTOPDF_VERSION}.jammy_${ARCH}.deb"
+    WKHTMLTOPDF_TEMP="$(mktemp --suffix=.deb)"
+    TEMP_FILES+=("$WKHTMLTOPDF_TEMP")
+    curl -fL --retry 3 --output "$WKHTMLTOPDF_TEMP" \
+        "${WKHTMLTOPDF_BASE_URL}/${WKHTMLTOPDF_PACKAGE}"
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$WKHTMLTOPDF_TEMP"
+    wkhtmltopdf --version | grep -Fq "wkhtmltopdf 0.12.6.1 (with patched qt)" \
+        || fail "The expected patched-Qt wkhtmltopdf build was not installed."
 fi
 
-echo -e "\n---- Create ODOO system user ----"
-sudo adduser --system --quiet --shell=/bin/bash --home=$OE_HOME --gecos 'ODOO' --group $OE_USER
-#The user should also be added to the sudo'ers group.
-sudo adduser $OE_USER sudo
-
-echo -e "\n---- Create Log directory ----"
-sudo mkdir /var/log/$OE_USER
-sudo chown $OE_USER:$OE_USER /var/log/$OE_USER
-
-#--------------------------------------------------
-# Install ODOO
-#--------------------------------------------------
-echo -e "\n==== Installing ODOO Server ===="
-sudo git clone --depth 1 --branch $OE_VERSION https://github.com/odoo/odoo $OE_HOME_EXT/
-
-echo -e "\n---- Install Odoo Python requirements in an isolated environment ----"
-sudo python3 -m venv "$OE_HOME/venv"
-sudo "$OE_HOME/venv/bin/pip" install --upgrade "pip<24.1" "setuptools<66" wheel "Cython<3"
-# gevent 21.8.0 fails when its isolated build environment pulls Cython 3.
-sudo "$OE_HOME/venv/bin/pip" install "gevent==21.8.0" --no-build-isolation
-REQUIREMENTS_WITHOUT_GEVENT=$(mktemp)
-grep -vE '^[[:space:]]*gevent([=<>!~]|[[:space:]])' "$OE_HOME_EXT/requirements.txt" > "$REQUIREMENTS_WITHOUT_GEVENT"
-sudo "$OE_HOME/venv/bin/pip" install -r "$REQUIREMENTS_WITHOUT_GEVENT"
-rm -f "$REQUIREMENTS_WITHOUT_GEVENT"
-sudo chown -R "$OE_USER:$OE_USER" "$OE_HOME/venv"
-
-if [ $IS_ENTERPRISE = "True" ]; then
-    # Odoo Enterprise install!
-    sudo "$OE_HOME/venv/bin/pip" install psycopg2-binary pdfminer.six
-    echo -e "\n--- Create symlink for node"
-    sudo ln -s /usr/bin/nodejs /usr/bin/node
-    sudo su $OE_USER -c "mkdir $OE_HOME/enterprise"
-    sudo su $OE_USER -c "mkdir $OE_HOME/enterprise/addons"
-
-    GITHUB_RESPONSE=$(sudo git clone --depth 1 --branch $OE_VERSION https://github.com/odoo/enterprise "$OE_HOME/enterprise/addons" 2>&1)
-    while [[ $GITHUB_RESPONSE == *"Authentication"* ]]; do
-        echo "------------------------WARNING------------------------------"
-        echo "Your authentication with Github has failed! Please try again."
-        printf "In order to clone and install the Odoo enterprise version you \nneed to be an offical Odoo partner and you need access to\nhttp://github.com/odoo/enterprise.\n"
-        echo "TIP: Press ctrl+c to stop this script."
-        echo "-------------------------------------------------------------"
-        echo " "
-        GITHUB_RESPONSE=$(sudo git clone --depth 1 --branch $OE_VERSION https://github.com/odoo/enterprise "$OE_HOME/enterprise/addons" 2>&1)
-    done
-
-    echo -e "\n---- Added Enterprise code under $OE_HOME/enterprise/addons ----"
-    echo -e "\n---- Installing Enterprise specific libraries ----"
-    sudo "$OE_HOME/venv/bin/pip" install num2words ofxparse dbfread ebaysdk firebase_admin pyOpenSSL
-    sudo npm install -g less
-    sudo npm install -g less-plugin-clean-css
+#-------------------------------------------------------------------------------
+# Odoo Community and Enterprise source
+#-------------------------------------------------------------------------------
+echo_section "Creating the Odoo service account"
+if ! id "$OE_USER" >/dev/null 2>&1; then
+    sudo adduser --system --quiet --shell=/bin/bash --home="$OE_HOME" \
+        --gecos "Odoo" --group "$OE_USER"
 fi
+sudo install -d -o "$OE_USER" -g "$OE_USER" -m 0750 "/var/log/${OE_USER}"
 
-echo -e "\n---- Create custom module directory ----"
-sudo su $OE_USER -c "mkdir $OE_HOME/custom"
-sudo su $OE_USER -c "mkdir $OE_HOME/custom/addons"
+echo_section "Cloning Odoo ${OE_VERSION} Community"
+sudo git clone --depth 1 --branch "$OE_VERSION" https://github.com/odoo/odoo.git "$OE_HOME_EXT"
 
-echo -e "\n---- Setting permissions on home folder ----"
-sudo chown -R $OE_USER:$OE_USER $OE_HOME/*
-
-echo -e "* Create server config file"
-
-
-sudo touch /etc/${OE_CONFIG}.conf
-echo -e "* Creating server config file"
-sudo su root -c "printf '[options] \n; This is the password that allows database operations:\n' >> /etc/${OE_CONFIG}.conf"
-if [ $GENERATE_RANDOM_PASSWORD = "True" ]; then
-    echo -e "* Generating random admin password"
-    OE_SUPERADMIN=$(openssl rand -hex 8)
-fi
-sudo su root -c "printf 'admin_passwd = ${OE_SUPERADMIN}\n' >> /etc/${OE_CONFIG}.conf"
-if [ $OE_VERSION > "11.0" ];then
-    sudo su root -c "printf 'http_port = ${OE_PORT}\n' >> /etc/${OE_CONFIG}.conf"
-else
-    sudo su root -c "printf 'xmlrpc_port = ${OE_PORT}\n' >> /etc/${OE_CONFIG}.conf"
-fi
-sudo su root -c "printf 'logfile = /var/log/${OE_USER}/${OE_CONFIG}.log\n' >> /etc/${OE_CONFIG}.conf"
-
-if [ $IS_ENTERPRISE = "True" ]; then
-    sudo su root -c "printf 'addons_path=${OE_HOME}/enterprise/addons,${OE_HOME_EXT}/addons\n' >> /etc/${OE_CONFIG}.conf"
-else
-    sudo su root -c "printf 'addons_path=${OE_HOME_EXT}/addons,${OE_HOME}/custom/addons\n' >> /etc/${OE_CONFIG}.conf"
-fi
-sudo chown $OE_USER:$OE_USER /etc/${OE_CONFIG}.conf
-sudo chmod 640 /etc/${OE_CONFIG}.conf
-
-echo -e "* Create startup file"
-sudo su root -c "echo '#!/bin/sh' >> $OE_HOME_EXT/start.sh"
-sudo su root -c "echo 'sudo -u $OE_USER $OE_HOME/venv/bin/python $OE_HOME_EXT/odoo-bin --config=/etc/${OE_CONFIG}.conf' >> $OE_HOME_EXT/start.sh"
-sudo chmod 755 $OE_HOME_EXT/start.sh
-
-#--------------------------------------------------
-# Adding ODOO as a deamon (initscript)
-#--------------------------------------------------
-
-echo -e "* Create init file"
-cat <<EOF > ~/$OE_CONFIG
-#!/bin/sh
-### BEGIN INIT INFO
-# Provides: $OE_CONFIG
-# Required-Start: \$remote_fs \$syslog
-# Required-Stop: \$remote_fs \$syslog
-# Should-Start: \$network
-# Should-Stop: \$network
-# Default-Start: 2 3 4 5
-# Default-Stop: 0 1 6
-# Short-Description: Enterprise Business Applications
-# Description: ODOO Business Applications
-### END INIT INFO
-PATH=$OE_HOME/venv/bin:/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin
-DAEMON=$OE_HOME/venv/bin/python
-NAME=$OE_CONFIG
-DESC=$OE_CONFIG
-# Specify the user name (Default: odoo).
-USER=$OE_USER
-# Specify an alternate config file (Default: /etc/openerp-server.conf).
-CONFIGFILE="/etc/${OE_CONFIG}.conf"
-# pidfile
-PIDFILE=/var/run/\${NAME}.pid
-# Additional options that are passed to the Daemon.
-DAEMON_OPTS="$OE_HOME_EXT/odoo-bin -c \$CONFIGFILE"
-[ -x \$DAEMON ] || exit 0
-[ -f \$CONFIGFILE ] || exit 0
-checkpid() {
-[ -f \$PIDFILE ] || return 1
-pid=\`cat \$PIDFILE\`
-[ -d /proc/\$pid ] && return 0
-return 1
-}
-case "\${1}" in
-start)
-echo -n "Starting \${DESC}: "
-start-stop-daemon --start --quiet --pidfile \$PIDFILE \
---chuid \$USER --background --make-pidfile \
---exec \$DAEMON -- \$DAEMON_OPTS
-echo "\${NAME}."
-;;
-stop)
-echo -n "Stopping \${DESC}: "
-start-stop-daemon --stop --quiet --pidfile \$PIDFILE \
---oknodo
-echo "\${NAME}."
-;;
-restart|force-reload)
-echo -n "Restarting \${DESC}: "
-start-stop-daemon --stop --quiet --pidfile \$PIDFILE \
---oknodo
-sleep 1
-start-stop-daemon --start --quiet --pidfile \$PIDFILE \
---chuid \$USER --background --make-pidfile \
---exec \$DAEMON -- \$DAEMON_OPTS
-echo "\${NAME}."
-;;
-*)
-N=/etc/init.d/\$NAME
-echo "Usage: \$NAME {start|stop|restart|force-reload}" >&2
-exit 1
-;;
-esac
-exit 0
-EOF
-
-echo -e "* Security Init File"
-sudo mv ~/$OE_CONFIG /etc/init.d/$OE_CONFIG
-sudo chmod 755 /etc/init.d/$OE_CONFIG
-sudo chown root: /etc/init.d/$OE_CONFIG
-
-echo -e "* Start ODOO on Startup"
-sudo update-rc.d $OE_CONFIG defaults
-
-#--------------------------------------------------
-# Install Nginx if needed
-#--------------------------------------------------
-if [ $INSTALL_NGINX = "True" ]; then
-  echo -e "\n---- Installing and setting up Nginx ----"
-  sudo apt-get install -y nginx
-
-  # Trust CF-Connecting-IP only when the connection itself came from a
-  # published Cloudflare network. This makes $remote_addr the visitor IP.
-  CF_REALIP_TEMP=$(mktemp)
-  {
-    echo "# Generated from Cloudflare's published network list"
-    curl -fsSL https://www.cloudflare.com/ips-v4 | sed 's/^/set_real_ip_from /; s/$/;/'
-    echo
-    curl -fsSL https://www.cloudflare.com/ips-v6 | sed 's/^/set_real_ip_from /; s/$/;/'
-    echo
-    echo "real_ip_header CF-Connecting-IP;"
-    echo "real_ip_recursive on;"
-  } > "$CF_REALIP_TEMP"
-  grep -q '^set_real_ip_from ' "$CF_REALIP_TEMP"
-  sudo install -m 0644 "$CF_REALIP_TEMP" /etc/nginx/conf.d/cloudflare-realip.conf
-  rm -f "$CF_REALIP_TEMP"
-
-  if [ "$ENABLE_SSL" = "True" ]; then
-    if [ ! -s "$CF_CERT_SOURCE" ] || [ ! -s "$CF_KEY_SOURCE" ]; then
-      echo "ERROR: Cloudflare certificate or private key is missing/empty." >&2
-      exit 1
+if is_true "$IS_ENTERPRISE"; then
+    echo_section "Cloning Odoo ${OE_VERSION} Enterprise"
+    sudo install -d -o "$OE_USER" -g "$OE_USER" "${OE_HOME}/enterprise"
+    if ! sudo git clone --depth 1 --branch "$OE_VERSION" "$ENTERPRISE_REPO" \
+        "${OE_HOME}/enterprise/addons"; then
+        fail "Enterprise clone failed. Confirm this GitHub account can access odoo/enterprise and authenticate with a PAT or SSH key."
     fi
-    sudo install -d -m 0755 "$NGINX_SSL_DIR"
-    sudo install -m 0644 "$CF_CERT_SOURCE" "$CF_CERT_PATH"
-    sudo install -m 0600 "$CF_KEY_SOURCE" "$CF_KEY_PATH"
-    # The originals were explicitly supplied for relocation.
-    sudo rm -f "$CF_CERT_SOURCE" "$CF_KEY_SOURCE"
-  fi
+fi
 
-  cat <<EOF > ~/odoo
-server {
-  listen 80;
-  server_name $WEBSITE_NAME;
+sudo install -d -o "$OE_USER" -g "$OE_USER" "${OE_HOME}/custom/addons"
 
-  location / {
-    return 301 https://\$host\$request_uri;
-  }
+echo_section "Installing Odoo Python requirements in an isolated environment"
+sudo python3 -m venv "${OE_HOME}/venv"
+PYTHON_MINOR="$("${OE_HOME}/venv/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+if [ "$PYTHON_MINOR" = "3.10" ]; then
+    # Odoo 18 pins gevent 21.8.0 on Jammy; its build must not pull Cython 3.
+    sudo "${OE_HOME}/venv/bin/pip" install --upgrade "pip<24.1" "setuptools<66" wheel "Cython<3"
+    sudo "${OE_HOME}/venv/bin/pip" install "gevent==21.8.0" --no-build-isolation
+    REQUIREMENTS_WITHOUT_GEVENT="$(mktemp)"
+    TEMP_FILES+=("$REQUIREMENTS_WITHOUT_GEVENT")
+    grep -vE '^[[:space:]]*gevent([=<>!~]|[[:space:]])' \
+        "${OE_HOME_EXT}/requirements.txt" > "$REQUIREMENTS_WITHOUT_GEVENT"
+    sudo "${OE_HOME}/venv/bin/pip" install -r "$REQUIREMENTS_WITHOUT_GEVENT"
+else
+    sudo "${OE_HOME}/venv/bin/pip" install --upgrade pip setuptools wheel
+    sudo "${OE_HOME}/venv/bin/pip" install -r "${OE_HOME_EXT}/requirements.txt"
+fi
+
+if is_true "$IS_ENTERPRISE"; then
+    sudo "${OE_HOME}/venv/bin/pip" install \
+        dbfread ebaysdk firebase-admin pdfminer.six
+    sudo npm install -g less less-plugin-clean-css
+fi
+sudo chown -R "$OE_USER:$OE_USER" "$OE_HOME"
+
+#-------------------------------------------------------------------------------
+# Odoo configuration and systemd service
+#-------------------------------------------------------------------------------
+echo_section "Writing Odoo configuration"
+if is_true "$GENERATE_RANDOM_PASSWORD"; then
+    OE_SUPERADMIN="$(openssl rand -hex 16)"
+fi
+
+ADDONS_PATH="${OE_HOME_EXT}/addons,${OE_HOME}/custom/addons"
+if is_true "$IS_ENTERPRISE"; then
+    ADDONS_PATH="${OE_HOME}/enterprise/addons,${ADDONS_PATH}"
+fi
+
+ODOO_CONFIG_TEMP="$(mktemp)"
+TEMP_FILES+=("$ODOO_CONFIG_TEMP")
+{
+    echo "[options]"
+    echo "admin_passwd = ${OE_SUPERADMIN}"
+    echo "http_interface = 127.0.0.1"
+    echo "http_port = ${OE_PORT}"
+    echo "gevent_port = ${GEVENT_PORT}"
+    echo "workers = ${WORKERS}"
+    echo "max_cron_threads = 1"
+    if is_true "$INSTALL_NGINX"; then
+        echo "proxy_mode = True"
+    else
+        echo "proxy_mode = False"
+    fi
+    echo "logfile = /var/log/${OE_USER}/${OE_CONFIG}.log"
+    echo "addons_path = ${ADDONS_PATH}"
+    echo "; Set list_db = False after restoring/creating the production database."
+    echo "; dbfilter = ^your_database_name$"
+} > "$ODOO_CONFIG_TEMP"
+sudo install -o "$OE_USER" -g "$OE_USER" -m 0640 "$ODOO_CONFIG_TEMP" "/etc/${OE_CONFIG}.conf"
+
+SYSTEMD_TEMP="$(mktemp)"
+TEMP_FILES+=("$SYSTEMD_TEMP")
+{
+    echo "[Unit]"
+    echo "Description=Odoo ${OE_VERSION}"
+    echo "After=network.target postgresql.service"
+    echo "Requires=postgresql.service"
+    echo
+    echo "[Service]"
+    echo "Type=simple"
+    echo "User=${OE_USER}"
+    echo "Group=${OE_USER}"
+    echo "ExecStart=${OE_HOME}/venv/bin/python ${OE_HOME_EXT}/odoo-bin --config=/etc/${OE_CONFIG}.conf"
+    echo "Restart=on-failure"
+    echo "RestartSec=5s"
+    echo "PrivateTmp=true"
+    echo
+    echo "[Install]"
+    echo "WantedBy=multi-user.target"
+} > "$SYSTEMD_TEMP"
+sudo install -o root -g root -m 0644 "$SYSTEMD_TEMP" "/etc/systemd/system/${OE_CONFIG}.service"
+sudo systemctl daemon-reload
+sudo systemctl enable "$OE_CONFIG"
+
+#-------------------------------------------------------------------------------
+# Nginx and Cloudflare Origin SSL
+#-------------------------------------------------------------------------------
+if is_true "$INSTALL_NGINX"; then
+    echo_section "Installing and configuring Nginx"
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nginx
+
+    CF_REALIP_TEMP="$(mktemp)"
+    TEMP_FILES+=("$CF_REALIP_TEMP")
+    {
+        echo "# Generated from Cloudflare's published network lists"
+        curl -fsSL https://www.cloudflare.com/ips-v4 | sed 's/^/set_real_ip_from /; s/$/;/'
+        echo
+        curl -fsSL https://www.cloudflare.com/ips-v6 | sed 's/^/set_real_ip_from /; s/$/;/'
+        echo
+        echo "real_ip_header CF-Connecting-IP;"
+        echo "real_ip_recursive on;"
+    } > "$CF_REALIP_TEMP"
+    grep -q '^set_real_ip_from ' "$CF_REALIP_TEMP" \
+        || fail "Cloudflare IP ranges could not be downloaded."
+    sudo install -o root -g root -m 0644 "$CF_REALIP_TEMP" /etc/nginx/conf.d/cloudflare-realip.conf
+
+    if is_true "$ENABLE_SSL"; then
+        sudo install -d -o root -g root -m 0755 "$NGINX_SSL_DIR"
+        sudo install -o root -g root -m 0644 "$CF_CERT_SOURCE" "$CF_CERT_PATH"
+        sudo install -o root -g root -m 0600 "$CF_KEY_SOURCE" "$CF_KEY_PATH"
+        if is_true "$REMOVE_CF_SOURCE_FILES"; then
+            sudo rm -f "$CF_CERT_SOURCE" "$CF_KEY_SOURCE"
+        fi
+    fi
+
+    NGINX_TEMP="$(mktemp)"
+    TEMP_FILES+=("$NGINX_TEMP")
+    if is_true "$ENABLE_SSL"; then
+        cat > "$NGINX_TEMP" <<EOF
+map \$http_upgrade \$connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+upstream odoo_backend {
+    server 127.0.0.1:${OE_PORT};
+}
+
+upstream odoo_gevent {
+    server 127.0.0.1:${GEVENT_PORT};
 }
 
 server {
-  listen 443 ssl http2;
-  server_name $WEBSITE_NAME;
+    listen 80;
+    listen [::]:80;
+    server_name ${WEBSITE_NAME};
+    return 301 https://\$host\$request_uri;
+}
 
-  ssl_certificate $CF_CERT_PATH;
-  ssl_certificate_key $CF_KEY_PATH;
-  ssl_protocols TLSv1.2 TLSv1.3;
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${WEBSITE_NAME};
 
-  # Add Headers for odoo proxy mode
-  proxy_set_header X-Forwarded-Host \$host;
-  proxy_set_header X-Forwarded-For \$remote_addr;
-  proxy_set_header X-Forwarded-Proto https;
-  proxy_set_header X-Real-IP \$remote_addr;
-  add_header X-Frame-Options "SAMEORIGIN";
-  proxy_set_header X-Client-IP \$remote_addr;
+    ssl_certificate ${CF_CERT_PATH};
+    ssl_certificate_key ${CF_KEY_PATH};
+    ssl_protocols TLSv1.2 TLSv1.3;
 
-  #   odoo    log files
-  access_log  /var/log/nginx/$OE_USER-access.log;
-  error_log       /var/log/nginx/$OE_USER-error.log;
+    access_log /var/log/nginx/${OE_USER}-access.log;
+    error_log /var/log/nginx/${OE_USER}-error.log;
+    client_max_body_size 0;
+    proxy_read_timeout 900s;
+    proxy_connect_timeout 900s;
+    proxy_send_timeout 900s;
 
-  #   increase    proxy   buffer  size
-  proxy_buffers   16  64k;
-  proxy_buffer_size   128k;
+    location /websocket {
+        proxy_pass http://odoo_gevent;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_set_header X-Forwarded-Host \$http_host;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
 
-  proxy_read_timeout 900s;
-  proxy_connect_timeout 900s;
-  proxy_send_timeout 900s;
+    location / {
+        proxy_pass http://odoo_backend;
+        proxy_redirect off;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Host \$http_host;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
 
-  #   force   timeouts    if  the backend dies
-  proxy_next_upstream error   timeout invalid_header  http_500    http_502
-  http_503;
-
-  types {
-    text/less less;
-    text/scss scss;
-  }
-
-  #   enable  data    compression
-  gzip    on;
-  gzip_min_length 1100;
-  gzip_buffers    4   32k;
-  gzip_types  text/css text/less text/plain text/xml application/xml application/json application/javascript application/pdf image/jpeg image/png;
-  gzip_vary   on;
-  client_header_buffer_size 4k;
-  large_client_header_buffers 4 64k;
-  client_max_body_size 0;
-
-  location / {
-    proxy_pass    http://127.0.0.1:$OE_PORT;
-    # by default, do not forward anything
-    proxy_redirect off;
-  }
-
-  location /longpolling {
-    proxy_pass http://127.0.0.1:$LONGPOLLING_PORT;
-  }
-
-  location ~* .(js|css|png|jpg|jpeg|gif|ico)$ {
-    expires 2d;
-    proxy_pass http://127.0.0.1:$OE_PORT;
-    add_header Cache-Control "public, no-transform";
-  }
-
-  # cache some static data in memory for 60mins.
-  location ~ /[a-zA-Z0-9_-]*/static/ {
-    proxy_cache_valid 200 302 60m;
-    proxy_cache_valid 404      1m;
-    proxy_buffering    on;
-    expires 864000;
-    proxy_pass    http://127.0.0.1:$OE_PORT;
-  }
+    location ~* /web/static/ {
+        proxy_pass http://odoo_backend;
+        proxy_cache_valid 200 60m;
+        proxy_buffering on;
+        expires 864000;
+    }
 }
 EOF
+    else
+        cat > "$NGINX_TEMP" <<EOF
+map \$http_upgrade \$connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+upstream odoo_backend { server 127.0.0.1:${OE_PORT}; }
+upstream odoo_gevent { server 127.0.0.1:${GEVENT_PORT}; }
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${WEBSITE_NAME};
+    client_max_body_size 0;
+    proxy_read_timeout 900s;
+    location /websocket {
+        proxy_pass http://odoo_gevent;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_set_header X-Forwarded-Host \$http_host;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+    location / {
+        proxy_pass http://odoo_backend;
+        proxy_redirect off;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Host \$http_host;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+}
+EOF
+    fi
 
-  sudo mv ~/odoo /etc/nginx/sites-available/$WEBSITE_NAME
-  sudo ln -sfn /etc/nginx/sites-available/$WEBSITE_NAME /etc/nginx/sites-enabled/$WEBSITE_NAME
-  sudo rm -f /etc/nginx/sites-enabled/default
-  sudo nginx -t
-  sudo systemctl reload nginx
-  sudo su root -c "printf 'proxy_mode = True\n' >> /etc/${OE_CONFIG}.conf"
-  echo "Done! The Nginx server is up and running. Configuration can be found at /etc/nginx/sites-available/$WEBSITE_NAME"
-else
-  echo "Nginx isn't installed due to choice of the user!"
+    sudo install -o root -g root -m 0644 "$NGINX_TEMP" "/etc/nginx/sites-available/${WEBSITE_NAME}"
+    sudo ln -sfn "/etc/nginx/sites-available/${WEBSITE_NAME}" "/etc/nginx/sites-enabled/${WEBSITE_NAME}"
+    sudo rm -f /etc/nginx/sites-enabled/default
+    sudo nginx -t
+    sudo systemctl enable nginx
+    sudo systemctl reload nginx
 fi
 
-#--------------------------------------------------
-# SSL is provided by a Cloudflare Origin Certificate
-#--------------------------------------------------
-
-if [ $INSTALL_NGINX = "True" ] && [ $ENABLE_SSL = "True" ] && [ $WEBSITE_NAME != "_" ];then
-  echo "SSL/HTTPS is enabled with the Cloudflare Origin Certificate."
-else
-  echo "SSL/HTTPS isn't enabled due to configuration."
+echo_section "Starting Odoo"
+sudo systemctl start "$OE_CONFIG"
+sleep 2
+if ! sudo systemctl is-active --quiet "$OE_CONFIG"; then
+    sudo systemctl --no-pager --full status "$OE_CONFIG" || true
+    fail "Odoo failed to remain active after startup. Check the status and log above."
 fi
 
-echo -e "* Starting Odoo Service"
-sudo su root -c "/etc/init.d/$OE_CONFIG start"
-echo "-----------------------------------------------------------"
-echo "Done! The Odoo server is up and running. Specifications:"
-echo "Port: $OE_PORT"
-echo "User service: $OE_USER"
-echo "Configuraton file location: /etc/${OE_CONFIG}.conf"
-echo "Logfile location: /var/log/$OE_USER"
-echo "User PostgreSQL: $OE_USER"
-echo "Code location: $OE_USER"
-echo "Addons folder: $OE_USER/$OE_CONFIG/addons/"
-echo "Password superadmin (database): $OE_SUPERADMIN"
-echo "Start Odoo service: sudo service $OE_CONFIG start"
-echo "Stop Odoo service: sudo service $OE_CONFIG stop"
-echo "Restart Odoo service: sudo service $OE_CONFIG restart"
-if [ $INSTALL_NGINX = "True" ]; then
-  echo "Nginx configuration file: /etc/nginx/sites-available/$WEBSITE_NAME"
-fi
-echo "-----------------------------------------------------------"
+cat <<EOF
+
+-----------------------------------------------------------
+Odoo ${OE_VERSION} installation completed.
+Service:             ${OE_CONFIG}
+Configuration:       /etc/${OE_CONFIG}.conf
+Log:                 /var/log/${OE_USER}/${OE_CONFIG}.log
+Community source:    ${OE_HOME_EXT}
+Enterprise addons:  ${OE_HOME}/enterprise/addons
+Custom addons:       ${OE_HOME}/custom/addons
+PostgreSQL role:     ${OE_USER}
+Database master password: ${OE_SUPERADMIN}
+
+After restoring your production database, set list_db = False and a strict
+dbfilter in /etc/${OE_CONFIG}.conf, then restart ${OE_CONFIG}.
+For Cloudflare, enable the proxy and use SSL/TLS mode Full (strict).
+-----------------------------------------------------------
+EOF
