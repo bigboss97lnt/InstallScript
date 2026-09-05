@@ -28,15 +28,22 @@ Edit the variables at the top of `odoo_install.sh`, especially:
 - `WORKERS`: size this for the server's CPU and memory
 - `OE_USER`, ports, and database master-password settings if their defaults
   conflict with another Odoo installation
-- `ENTERPRISE_REPO`: change this to an SSH URL if SSH authentication is
-  preferred
+- `ENTERPRISE_REPO`: the private Enterprise Git repository; SSH is the default
 
 Enterprise is enabled by default. The GitHub identity used while running the
 script must have access to the private
-[odoo/enterprise](https://github.com/odoo/enterprise) repository. With the
-default HTTPS URL, use your GitHub username and a personal access token when Git
-prompts for credentials; GitHub account passwords cannot authenticate Git
-operations.
+[odoo/enterprise](https://github.com/odoo/enterprise) repository. Configure SSH
+access as the normal login user before running the installer:
+
+```bash
+ssh -T git@github.com
+git ls-remote git@github.com:odoo/enterprise.git refs/heads/18.0
+```
+
+When the script is launched with `sudo`, private Git operations are deliberately
+run as the original login user instead of `root`. Enterprise access is checked
+immediately after installing the small bootstrap toolset and before the large
+dependency installation.
 
 ## Cloudflare Origin Certificate
 
@@ -64,7 +71,9 @@ sudo ./odoo_install.sh
 
 The preflight check stops before changing the server if the OS or architecture
 is unsupported, the hostname is still the placeholder, the certificate files
-are missing, or an Odoo installation already occupies the target path.
+are missing, or Enterprise access is unavailable. A valid existing Odoo 18
+Community or Enterprise checkout is reused, allowing a failed installation to
+resume safely.
 
 ## What the script configures
 

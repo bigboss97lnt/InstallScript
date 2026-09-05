@@ -26,8 +26,9 @@ INSTALL_WKHTMLTOPDF="True"
 INSTALL_NGINX="True"
 ENABLE_SSL="True"
 
-# Enterprise access requires an authorized GitHub account/PAT or SSH setup.
-ENTERPRISE_REPO="https://github.com/odoo/enterprise.git"
+# Enterprise access requires an authorized GitHub account and SSH key.
+# Private Git operations run as the user who invoked sudo, not as root.
+ENTERPRISE_REPO="git@github.com:odoo/enterprise.git"
 
 # Nginx / Cloudflare. Change WEBSITE_NAME before running the script.
 WEBSITE_NAME="odoo.example.com"
@@ -68,6 +69,15 @@ echo_section() {
     printf '\n---- %s ----\n' "$1"
 }
 
+INVOKING_USER="${SUDO_USER:-$(id -un)}"
+run_as_invoking_user() {
+    if [ "$(id -u)" -eq 0 ] && [ "$INVOKING_USER" != "root" ]; then
+        sudo -u "$INVOKING_USER" -H "$@"
+    else
+        "$@"
+    fi
+}
+
 #-------------------------------------------------------------------------------
 # Preflight
 #-------------------------------------------------------------------------------
@@ -100,7 +110,9 @@ if is_true "$INSTALL_NGINX" && is_true "$ENABLE_SSL"; then
     [ -s "$CF_CERT_SOURCE" ] || fail "Cloudflare Origin Certificate not found: ${CF_CERT_SOURCE}"
     [ -s "$CF_KEY_SOURCE" ] || fail "Cloudflare Origin private key not found: ${CF_KEY_SOURCE}"
 fi
-[ ! -e "$OE_HOME_EXT" ] || fail "Odoo target already exists: ${OE_HOME_EXT}"
+if sudo test -e "$OE_HOME_EXT" && ! sudo test -d "${OE_HOME_EXT}/.git"; then
+    fail "Odoo target exists but is not a Git checkout: ${OE_HOME_EXT}"
+fi
 
 #-------------------------------------------------------------------------------
 # Base packages and PostgreSQL
@@ -109,6 +121,15 @@ echo_section "Updating server and installing base dependencies"
 sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
     ca-certificates curl git gnupg lsb-release software-properties-common
+
+if is_true "$IS_ENTERPRISE"; then
+    echo_section "Verifying Odoo Enterprise GitHub access as ${INVOKING_USER}"
+    if ! run_as_invoking_user env GIT_TERMINAL_PROMPT=0 \
+        git ls-remote --exit-code "$ENTERPRISE_REPO" "refs/heads/${OE_VERSION}" >/dev/null; then
+        fail "Cannot access Odoo Enterprise as ${INVOKING_USER}. Configure that user's SSH key for a GitHub account with odoo/enterprise access, then rerun. No Odoo packages or source were changed after this check."
+    fi
+fi
+
 sudo add-apt-repository -y universe
 sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
@@ -181,14 +202,35 @@ fi
 sudo install -d -o "$OE_USER" -g "$OE_USER" -m 0750 "/var/log/${OE_USER}"
 
 echo_section "Cloning Odoo ${OE_VERSION} Community"
-sudo git clone --depth 1 --branch "$OE_VERSION" https://github.com/odoo/odoo.git "$OE_HOME_EXT"
+if sudo test -d "${OE_HOME_EXT}/.git"; then
+    INSTALLED_BRANCH="$(sudo git -C "$OE_HOME_EXT" branch --show-current)"
+    [ "$INSTALLED_BRANCH" = "$OE_VERSION" ] \
+        || fail "Existing Community checkout is branch ${INSTALLED_BRANCH}, expected ${OE_VERSION}."
+    echo "Reusing the existing Odoo Community ${OE_VERSION} checkout."
+else
+    sudo git clone --depth 1 --branch "$OE_VERSION" https://github.com/odoo/odoo.git "$OE_HOME_EXT"
+fi
 
 if is_true "$IS_ENTERPRISE"; then
     echo_section "Cloning Odoo ${OE_VERSION} Enterprise"
     sudo install -d -o "$OE_USER" -g "$OE_USER" "${OE_HOME}/enterprise"
-    if ! sudo git clone --depth 1 --branch "$OE_VERSION" "$ENTERPRISE_REPO" \
-        "${OE_HOME}/enterprise/addons"; then
-        fail "Enterprise clone failed. Confirm this GitHub account can access odoo/enterprise and authenticate with a PAT or SSH key."
+    if sudo test -d "${OE_HOME}/enterprise/addons/.git"; then
+        INSTALLED_ENTERPRISE_BRANCH="$(sudo git -C "${OE_HOME}/enterprise/addons" branch --show-current)"
+        [ "$INSTALLED_ENTERPRISE_BRANCH" = "$OE_VERSION" ] \
+            || fail "Existing Enterprise checkout is branch ${INSTALLED_ENTERPRISE_BRANCH}, expected ${OE_VERSION}."
+        echo "Reusing the existing Odoo Enterprise ${OE_VERSION} checkout."
+    elif sudo test -e "${OE_HOME}/enterprise/addons"; then
+        fail "Enterprise target exists but is not a Git checkout: ${OE_HOME}/enterprise/addons"
+    else
+        ENTERPRISE_TEMP="$(run_as_invoking_user mktemp -d /tmp/odoo-enterprise.XXXXXX)"
+        if ! run_as_invoking_user env GIT_TERMINAL_PROMPT=0 \
+            git clone --depth 1 --branch "$OE_VERSION" "$ENTERPRISE_REPO" \
+            "${ENTERPRISE_TEMP}/addons"; then
+            run_as_invoking_user rmdir "$ENTERPRISE_TEMP" 2>/dev/null || true
+            fail "Enterprise clone failed after its access check. Verify the GitHub connection and rerun."
+        fi
+        sudo mv "${ENTERPRISE_TEMP}/addons" "${OE_HOME}/enterprise/addons"
+        run_as_invoking_user rmdir "$ENTERPRISE_TEMP"
     fi
 fi
 
