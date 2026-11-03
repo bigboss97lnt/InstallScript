@@ -1,85 +1,173 @@
-# [Odoo](https://www.odoo.com "Odoo's Homepage") Install Script
+# Odoo 17 installer
 
-This script is based on the install script from André Schenkels (https://github.com/aschenkels-ictstudio/openerp-install-scripts)
-but goes a bit further and has been improved. This script will also give you the ability to define an xmlrpc_port in the .conf file that is generated under /etc/
-This script can be safely used in a multi-odoo code base server because the default Odoo port is changed BEFORE the Odoo is started.
+Fresh-server installer for **Ubuntu 24.04 LTS, AMD64, Python 3.12**. Installs Odoo
+17 Community, PostgreSQL 16, a native systemd service, Nginx, Cloudflare Origin
+SSL, and the pinned Python packages used by the validated deployment.
 
-## Supported platform
+Based on the installer by Yenthe Van Ginneken and André Schenkels. See LICENSE.
+The `16.0` branch remains separate; this branch does not support Debian.
 
-This version targets **Ubuntu 22.04 LTS (Jammy) on AMD64** and installs Odoo
-16.0. The platform check is intentional because the included wkhtmltopdf package
-is built specifically for Jammy AMD64.
+## Before installation
 
-## Nginx and Cloudflare SSL
+Use a fresh server with root/sudo access, outbound Internet access and sufficient
+RAM for three HTTP workers plus cron and gevent (the reference deployment had
+4 GB RAM). Memory limits below apply per worker; size the machine for workload.
+This is not an upgrade script. Back up an existing installation and use a
+migration procedure instead. Existing Odoo code/configuration causes an early exit.
 
-Set `INSTALL_NGINX="True"` to install Nginx. You should also configure Odoo
-workers for production use; see the [Odoo deployment guide](https://www.odoo.com/documentation/16.0/administration/install/deploy.html).
+Point your domain's Cloudflare DNS record at the server and enable proxying
+(orange cloud). Choose **Full (strict)** in Cloudflare SSL/TLS settings.
 
-HTTPS uses a **Cloudflare Origin Certificate**, not Certbot or Let's Encrypt.
-Before running the installer:
+### Download the entire branch
 
-1. Create an Origin Certificate in the Cloudflare dashboard for your hostname.
-2. Save the certificate as `/root/certificate`.
-3. Save its private key as `/root/private_key`.
-4. Set `WEBSITE_NAME` to the proxied Cloudflare hostname.
-5. Set both `INSTALL_NGINX="True"` and `ENABLE_SSL="True"`.
-6. After installation, enable the Cloudflare proxy and select **Full (strict)**
-   under SSL/TLS encryption mode.
+The installer needs the requirements file, Cloudflare helper and public CA file
+alongside it; downloading only the shell script is insufficient.
 
-The installer moves the files to
-`/etc/nginx/ssl/<website>/origin.crt` and `origin.key`, restricts the private key
-to mode `0600`, and removes the originals from `/root`. Never commit the private
-key to this repository.
-
-Nginx downloads Cloudflare's current IPv4 and IPv6 network lists and trusts
-`CF-Connecting-IP` only for connections originating from those networks. This
-restores the visitor address in Nginx logs and in the headers forwarded to Odoo.
-
-## Installation procedure
-
-##### 1. Download the script:
-```
-sudo wget https://raw.githubusercontent.com/bigboss97lnt/InstallScript/16.0/odoo_install.sh
-```
-##### 2. Modify the parameters as you wish.
-There are a few things you can configure, this is the most used list:<br/>
-`OE_USER` is the Odoo system user name.<br/>
-`GENERATE_RANDOM_PASSWORD` generates a secure database master password when set
-to `True`; otherwise `OE_SUPERADMIN` is used.<br/>
-`INSTALL_WKHTMLTOPDF` installs wkhtmltopdf 0.12.6.1 with patched Qt when set to
-`True`.<br/>
-`OE_PORT` is Odoo's HTTP port, normally `8069`.<br/>
-`LONGPOLLING_PORT` is Odoo's long-polling port, normally `8072`.<br/>
-`OE_VERSION` selects the Odoo branch and defaults to `16.0`.<br/>
-`IS_ENTERPRISE` installs Enterprise addons when set to `True`; GitHub access to
-the private Odoo Enterprise repository is required.<br/>
-`INSTALL_POSTGRESQL_FOURTEEN` installs PostgreSQL 14 from the official PGDG
-repository when set to `True`.<br/>
-`INSTALL_NGINX` installs and configures Nginx when set to `True`.<br/>
-`WEBSITE_NAME` must be changed from `_` to the Cloudflare hostname when Nginx is
-enabled.<br/>
-`ENABLE_SSL` enables the supplied Cloudflare Origin Certificate.<br/>
-`CF_CERT_SOURCE` and `CF_KEY_SOURCE` are the source certificate and private-key
-paths; they default to `/root/certificate` and `/root/private_key`.<br/>
-
-Python packages are installed in an isolated virtual environment at
-`/odoo/venv`. For Python 3.10 compatibility, gevent 21.8.0 is built separately
-with build isolation disabled and a compatible Cython version; the rest of the
-official Odoo 16 requirements are then installed normally.
-
-#### 3. Make the script executable
-```
-sudo chmod +x odoo_install.sh
-```
-##### 4. Execute the script:
-```
-sudo ./odoo_install.sh
+```bash
+sudo apt-get update
+sudo apt-get install -y git
+sudo git clone --branch 17.0 --single-branch https://github.com/bigboss97lnt/InstallScript.git /root/InstallScript
+sudo nano /root/InstallScript/odoo_install.sh
 ```
 
-## Where should I host Odoo?
-There are plenty of great services that offer good hosting. The script has been tested with a few major players such as [Google Cloud](https://cloud.google.com/), [Hetzner](https://www.hetzner.com/), [Amazon AWS](https://aws.amazon.com/) and [DigitalOcean](https://www.digitalocean.com/products/droplets/).
-If you'd like you can use my [DigitalOcean referral link](https://m.do.co/c/d605cc420682) which gives you a 200$ voucher for free for the first 60 days.
+Set the variables near the top of the script:
 
-## Minimal server requirements
-While technically you can run an Odoo instance on 1GB (1024MB) of RAM it is absolutely not advised. A Linux instance typically uses 300MB-500MB and the rest has to be split among Odoo, postgreSQL and others. If you install an Odoo you should make sure to use at least 2GB of RAM. This script might fail with less resources too.
-There are known issues on DigitalOcean for example where the installation crashes on 1GB RAM machines. See https://github.com/Yenthe666/InstallScript/issues/243
+| Setting | Instructions |
+| --- | --- |
+| `WEBSITE_NAME` | Replace `odoo.example.com` with your actual hostname. |
+| `CUSTOM_ADDONS_REPO` | Optional Git URL, e.g. `git@github.com:YOUR_ORG/YOUR_ADDONS.git`; empty skips cloning. |
+| `CUSTOM_ADDONS_BRANCH` | Optional branch; empty uses the repository's default branch. |
+| `SSH_PORT` | Set your actual SSH port **before** enabling the firewall. Default: `22`. |
+| `CLOUDFLARE_FIREWALL` | `True` restricts web access to Cloudflare; `False` leaves firewall management to you. |
+| `GENERATE_RANDOM_PASSWORD` | Keep `True` to generate a unique database master password. |
+| `IS_ENTERPRISE` | Default `False`; `True` requires authorized SSH access to `odoo/enterprise`. |
+| `INSTALL_NGINX`, `ENABLE_SSL` | Default `True`; recommended for the supplied configuration. |
+
+Public Odoo source is cloned over HTTPS. For private custom/Enterprise repos,
+configure a GitHub SSH key for the root account running the installer, verify
+GitHub's host key and test repository access beforehand. Do not put tokens or
+passwords in repository URLs. No GitHub credentials are included.
+
+Custom modules must be directly inside the chosen repository root. It is cloned
+into `/odoo/custom/addons`, which is already included in `addons_path`. Cloning
+makes modules discoverable; it does not install or upgrade them in a database.
+
+### Supply your SSL files
+
+1. In Cloudflare, create an **RSA Origin Certificate** covering your hostname.
+2. Save the PEM certificate as `/root/InstallScript/origin_cert`.
+3. Save its matching PEM private key as `/root/InstallScript/private_key`.
+4. Restrict the key permissions:
+
+```bash
+sudo chmod 600 /root/InstallScript/private_key
+```
+
+These files must contain actual PEM data, not filenames or dashboard text.
+The private key must be unencrypted for unattended Nginx startup. To use a
+different source directory, set `CF_CERT_HOME` when running the installer.
+
+The installer validates hostname, dates, CA signature and matching public keys
+before installation. The bundled `cloudflare-origin-ca.pem` is Cloudflare's
+**public RSA CA certificate**, not a deployment certificate or private key.
+Source: https://developers.cloudflare.com/ssl/static/origin_ca_rsa_root.pem
+
+Files are copied to `/etc/nginx/ssl/origin_cert.pem` and `origin_key.pem`; the
+private key is mode `0600`. Source files are retained and ignored by Git.
+Never commit keys, deployment certificates, generated configurations or logs.
+Origin certificates require Cloudflare proxying and are not browser-trusted for
+direct origin access. See [Cloudflare Origin CA documentation](https://developers.cloudflare.com/ssl/origin-configuration/origin-ca/).
+
+## Run
+
+```bash
+sudo bash /root/InstallScript/odoo_install.sh
+```
+
+The script exits on failure, waits for apt locks, and prints the generated
+**Odoo database master password** at completion. Save it securely; it is also in
+`/etc/odoo-server.conf`. Do not publish terminal output containing that password.
+The PostgreSQL role uses local peer authentication; no PostgreSQL password is
+set. No application database or application login is created. With `list_db =
+False`, database management is disabled; create or restore your database using
+your administrative deployment procedure before expecting an application login.
+
+If installation stops partway through, inspect the error and partial state;
+do not blindly rerun it over installed code/configuration.
+
+## Installed configuration
+
+The default Community configuration includes:
+
+```ini
+addons_path=/odoo/odoo-server/addons,/odoo/custom/addons
+proxy_mode = True
+http_interface = 127.0.0.1
+http_port = 8069
+gevent_port = 8072
+limit_memory_hard = 1929379840
+limit_memory_soft = 1442840576
+limit_request = 8192
+limit_time_cpu = 600
+limit_time_real = 1200
+max_cron_threads = 1
+workers = 3
+list_db = False
+```
+
+Enterprise mode also adds `/odoo/enterprise/addons`. Nginx routes WebSocket
+traffic to gevent and trusts `CF-Connecting-IP` only from validated Cloudflare
+networks. It tests its configuration before reload.
+
+Python lives in `/odoo/venv`. The venv inherits Ubuntu system packages to retain
+distro builds such as pandas `2.1.4+dfsg` and lz4 `4.0.2+dfsg`; pip writes stay
+inside the venv. The 169 explicit pins are in `odoo-requirements-pinned.txt`.
+The installer explicitly installs `zope.interface==6.1` inside the venv to avoid
+a distro namespace conflict that prevents the gevent worker from starting.
+OS utilities and security updates remain managed by apt; this does not recreate
+every package/version from another server's system-wide `pip list`.
+
+### Firewall behavior
+
+When enabled, the helper fetches and validates both official lists:
+https://www.cloudflare.com/ips-v4 and https://www.cloudflare.com/ips-v6.
+It denies unsolicited incoming traffic and allows TCP 80/443 only from those
+networks. **SSH remains an explicit exception on `SSH_PORT` from any address.**
+Outgoing and established connections are allowed. Odoo and PostgreSQL are not
+exposed directly with the default configuration.
+
+This firewall mode requires a fresh UFW rule set and IPv6 filtering enabled.
+It refuses existing UFW rules rather than resetting them or leaving broad web
+allows in place. Existing provider firewalls must also permit Cloudflare traffic
+and your administrative SSH access. Review Cloudflare range changes periodically;
+automatic updates are not installed. For an existing firewall, manage equivalent
+rules yourself and set `CLOUDFLARE_FIREWALL="False"`.
+
+## Validate and operate
+
+```bash
+sudo systemctl status odoo-server nginx postgresql
+sudo journalctl -u odoo-server -n 50 --no-pager
+sudo tail -n 50 /var/log/odoo/odoo-server.log
+sudo nginx -t
+sudo ufw status verbose
+/odoo/venv/bin/python -m pip check
+/odoo/venv/bin/python -m pip list
+curl -fsS 'http://127.0.0.1:8069/web/health?db_server_status=1'
+curl -fsS 'http://127.0.0.1:8072/web/health?db_server_status=1'
+curl -fsS 'https://YOUR_HOSTNAME/web/health?db_server_status=1'
+sudo systemctl restart odoo-server
+```
+
+Health checks should return `{"status": "pass", "db_server_status": true}`.
+They verify service/database connectivity, not custom-module functionality.
+Service: `/etc/systemd/system/odoo-server.service`.
+Configuration: `/etc/odoo-server.conf`.
+Nginx site: `/etc/nginx/sites-available/YOUR_HOSTNAME`.
+
+For read-only preparation checks:
+
+```bash
+bash -n odoo_install.sh
+python3 setup_cloudflare.py --check
+```
