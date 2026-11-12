@@ -38,7 +38,8 @@ OE_SUPERADMIN="admin"
 GENERATE_RANDOM_PASSWORD="True"
 OE_CONFIG="${OE_USER}-server"
 # Set the website name
-WEBSITE_NAME="blob.advanced-sol.com"
+# Set your domain before running (also used by the supplied TLS certificate).
+WEBSITE_NAME="your-domain.example"
 # Set the default Odoo longpolling port (you still have to use -c /etc/odoo-server.conf for example to use this.)
 LONGPOLLING_PORT="8072"
 # Set to "True" to install the supplied Cloudflare Origin Certificate.
@@ -59,6 +60,11 @@ if [[ "$(lsb_release -is)" != "Ubuntu" || ! "$(lsb_release -rs)" =~ ^(22\.04|24\
 fi
 if [[ "$(dpkg --print-architecture)" != "amd64" ]]; then
     echo "ERROR: The configured wkhtmltopdf package requires amd64." >&2
+    exit 1
+fi
+
+if [ "$INSTALL_NGINX" = "True" ] && [ "$WEBSITE_NAME" = "your-domain.example" ]; then
+    echo "ERROR: Set WEBSITE_NAME to your domain before running this installer." >&2
     exit 1
 fi
 
@@ -133,6 +139,7 @@ sudo git clone --depth 1 --branch $OE_VERSION https://github.com/odoo/odoo $OE_H
 
 echo -e "\n---- Install Odoo Python requirements in an isolated environment ----"
 sudo python3 -m venv "$OE_HOME/venv"
+PIP_CONSTRAINT_ARGS=()
 if "$OE_HOME/venv/bin/python" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)'; then
     # Python 3.12 removed pkgutil.ImpImporter; setuptools<66 cannot load.
     # Odoo 16 still imports pkg_resources, so setuptools must stay below 81.
@@ -142,10 +149,16 @@ if "$OE_HOME/venv/bin/python" -c 'import sys; sys.exit(0 if sys.version_info >= 
 else
 sudo "$OE_HOME/venv/bin/pip" install --upgrade "pip<24.1" "setuptools<66" wheel "Cython<3"
 # gevent 21.8.0 fails when its isolated build environment pulls Cython 3.
-sudo "$OE_HOME/venv/bin/pip" install "gevent==21.8.0" --no-build-isolation
+# Keep the legacy gevent/pkg_resources stack compatible throughout resolution.
+cat > "$OE_HOME/legacy-gevent-constraints.txt" <<'CONSTRAINTS'
+zope.interface==5.4.0
+zope.event==4.5.0
+CONSTRAINTS
+PIP_CONSTRAINT_ARGS=(-c "$OE_HOME/legacy-gevent-constraints.txt")
+sudo "$OE_HOME/venv/bin/pip" install "${PIP_CONSTRAINT_ARGS[@]}" "gevent==21.8.0" --no-build-isolation
 REQUIREMENTS_WITHOUT_GEVENT=$(mktemp)
 grep -vE '^[[:space:]]*gevent([=<>!~]|[[:space:]])' "$OE_HOME_EXT/requirements.txt" > "$REQUIREMENTS_WITHOUT_GEVENT"
-sudo "$OE_HOME/venv/bin/pip" install -r "$REQUIREMENTS_WITHOUT_GEVENT"
+sudo "$OE_HOME/venv/bin/pip" install "${PIP_CONSTRAINT_ARGS[@]}" -r "$REQUIREMENTS_WITHOUT_GEVENT"
 rm -f "$REQUIREMENTS_WITHOUT_GEVENT"
 fi
 sudo "$OE_HOME/venv/bin/python" -m pip check
@@ -153,7 +166,7 @@ sudo chown -R "$OE_USER:$OE_USER" "$OE_HOME/venv"
 
 if [ $IS_ENTERPRISE = "True" ]; then
     # Odoo Enterprise install!
-    sudo "$OE_HOME/venv/bin/pip" install psycopg2-binary pdfminer.six
+    sudo "$OE_HOME/venv/bin/pip" install "${PIP_CONSTRAINT_ARGS[@]}" psycopg2-binary pdfminer.six
     echo -e "\n--- Create symlink for node"
     sudo ln -s /usr/bin/nodejs /usr/bin/node
     sudo su $OE_USER -c "mkdir $OE_HOME/enterprise"
@@ -172,7 +185,7 @@ if [ $IS_ENTERPRISE = "True" ]; then
 
     echo -e "\n---- Added Enterprise code under $OE_HOME/enterprise/addons ----"
     echo -e "\n---- Installing Enterprise specific libraries ----"
-    sudo "$OE_HOME/venv/bin/pip" install num2words ofxparse dbfread ebaysdk firebase_admin pyOpenSSL
+    sudo "$OE_HOME/venv/bin/pip" install "${PIP_CONSTRAINT_ARGS[@]}" num2words ofxparse dbfread ebaysdk firebase_admin pyOpenSSL
     sudo npm install -g less
     sudo npm install -g less-plugin-clean-css
 fi
@@ -187,7 +200,11 @@ sudo chown -R $OE_USER:$OE_USER $OE_HOME/*
 echo -e "* Create server config file"
 
 
-sudo touch /etc/${OE_CONFIG}.conf
+# Back up an existing configuration and start fresh to avoid duplicate options.
+if [ -f "/etc/${OE_CONFIG}.conf" ]; then
+    sudo cp -a "/etc/${OE_CONFIG}.conf" "/etc/${OE_CONFIG}.conf.bak.$(date +%Y%m%d%H%M%S)"
+fi
+sudo install -m 0640 -o "$OE_USER" -g "$OE_USER" /dev/null "/etc/${OE_CONFIG}.conf"
 echo -e "* Creating server config file"
 sudo su root -c "printf '[options] \n; This is the password that allows database operations:\n' >> /etc/${OE_CONFIG}.conf"
 if [ $GENERATE_RANDOM_PASSWORD = "True" ]; then
@@ -221,83 +238,34 @@ sudo su root -c "echo 'sudo -u $OE_USER $OE_HOME/venv/bin/python $OE_HOME_EXT/od
 sudo chmod 755 $OE_HOME_EXT/start.sh
 
 #--------------------------------------------------
-# Adding ODOO as a deamon (initscript)
+# Native systemd supervision (Python stays in the foreground)
 #--------------------------------------------------
+sudo tee "/etc/systemd/system/${OE_CONFIG}.service" >/dev/null <<EOF
+[Unit]
+Description=Odoo Server
+Wants=network-online.target
+After=network-online.target postgresql.service
 
-echo -e "* Create init file"
-cat <<EOF > ~/$OE_CONFIG
-#!/bin/sh
-### BEGIN INIT INFO
-# Provides: $OE_CONFIG
-# Required-Start: \$remote_fs \$syslog
-# Required-Stop: \$remote_fs \$syslog
-# Should-Start: \$network
-# Should-Stop: \$network
-# Default-Start: 2 3 4 5
-# Default-Stop: 0 1 6
-# Short-Description: Enterprise Business Applications
-# Description: ODOO Business Applications
-### END INIT INFO
-PATH=$OE_HOME/venv/bin:/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin
-DAEMON=$OE_HOME/venv/bin/python
-NAME=$OE_CONFIG
-DESC=$OE_CONFIG
-# Specify the user name (Default: odoo).
-USER=$OE_USER
-# Specify an alternate config file (Default: /etc/openerp-server.conf).
-CONFIGFILE="/etc/${OE_CONFIG}.conf"
-# pidfile
-PIDFILE=/var/run/\${NAME}.pid
-# Additional options that are passed to the Daemon.
-DAEMON_OPTS="$OE_HOME_EXT/odoo-bin -c \$CONFIGFILE"
-[ -x \$DAEMON ] || exit 0
-[ -f \$CONFIGFILE ] || exit 0
-checkpid() {
-[ -f \$PIDFILE ] || return 1
-pid=\`cat \$PIDFILE\`
-[ -d /proc/\$pid ] && return 0
-return 1
-}
-case "\${1}" in
-start)
-echo -n "Starting \${DESC}: "
-start-stop-daemon --start --quiet --pidfile \$PIDFILE \
---chuid \$USER --background --make-pidfile \
---exec \$DAEMON -- \$DAEMON_OPTS
-echo "\${NAME}."
-;;
-stop)
-echo -n "Stopping \${DESC}: "
-start-stop-daemon --stop --quiet --pidfile \$PIDFILE \
---oknodo
-echo "\${NAME}."
-;;
-restart|force-reload)
-echo -n "Restarting \${DESC}: "
-start-stop-daemon --stop --quiet --pidfile \$PIDFILE \
---oknodo
-sleep 1
-start-stop-daemon --start --quiet --pidfile \$PIDFILE \
---chuid \$USER --background --make-pidfile \
---exec \$DAEMON -- \$DAEMON_OPTS
-echo "\${NAME}."
-;;
-*)
-N=/etc/init.d/\$NAME
-echo "Usage: \$NAME {start|stop|restart|force-reload}" >&2
-exit 1
-;;
-esac
-exit 0
+[Service]
+Type=simple
+User=${OE_USER}
+Group=${OE_USER}
+WorkingDirectory=${OE_HOME_EXT}
+Environment="PATH=${OE_HOME}/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=${OE_HOME}/venv/bin/python ${OE_HOME_EXT}/odoo-bin --config=/etc/${OE_CONFIG}.conf
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=120s
+TimeoutStopSec=120s
+KillSignal=SIGTERM
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
 EOF
-
-echo -e "* Security Init File"
-sudo mv ~/$OE_CONFIG /etc/init.d/$OE_CONFIG
-sudo chmod 755 /etc/init.d/$OE_CONFIG
-sudo chown root: /etc/init.d/$OE_CONFIG
-
-echo -e "* Start ODOO on Startup"
-sudo update-rc.d $OE_CONFIG defaults
+sudo chmod 0644 "/etc/systemd/system/${OE_CONFIG}.service"
+sudo systemctl daemon-reload
+sudo systemctl enable "${OE_CONFIG}.service"
 
 #--------------------------------------------------
 # Install Nginx if needed
@@ -450,22 +418,32 @@ else
 fi
 
 echo -e "* Starting Odoo Service"
-# Catch import/dependency failures before backgrounding the service.
-sudo -H -u "$OE_USER" bash -c 'cd "$1" && "$2" -c "import odoo"' _ "$OE_HOME_EXT" "$OE_HOME/venv/bin/python"
+# Check both Odoo and the gevent worker before starting the service.
+sudo -H -u "$OE_USER" bash -c 'cd "$1" && "$2" -c "from gevent import monkey; monkey.patch_all(); import odoo; import sys; odoo.tools.config.parse_config([sys.argv[1], sys.argv[2]])" -c "$3"' _ "$OE_HOME_EXT" "$OE_HOME/venv/bin/python" "/etc/${OE_CONFIG}.conf"
 sudo systemctl daemon-reload
-sudo systemctl start "$OE_CONFIG"
+sudo systemctl restart "$OE_CONFIG"
 
-# The legacy init script can return success even if Python immediately exits.
+# Type=simple reports process startup; also verify application readiness.
 ODOO_READY="False"
 for attempt in {1..30}; do
-    if curl --noproxy '*' --fail --silent --output /dev/null --max-time 2 "http://127.0.0.1:${OE_PORT}/web/login"; then
+    if sudo systemctl is-active --quiet "$OE_CONFIG" && curl --noproxy '*' --fail --silent --output /dev/null --max-time 2 "http://127.0.0.1:${OE_PORT}/web/login"; then
         ODOO_READY="True"
         break
     fi
     sleep 2
 done
+if [ "$ODOO_READY" = "True" ] && [ "$INSTALL_NGINX" = "True" ]; then
+    ODOO_READY="False"
+    for attempt in {1..30}; do
+        if "$OE_HOME/venv/bin/python" -c 'import socket, sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=2).close()' "$LONGPOLLING_PORT"; then
+            ODOO_READY="True"
+            break
+        fi
+        sleep 2
+    done
+fi
 if [ "$ODOO_READY" != "True" ]; then
-    echo "ERROR: Odoo did not respond on 127.0.0.1:${OE_PORT}." >&2
+    echo "ERROR: Odoo web or gevent endpoint did not become ready." >&2
     sudo systemctl status "$OE_CONFIG" --no-pager -l >&2 || true
     sudo tail -n 60 "/var/log/${OE_USER}/${OE_CONFIG}.log" >&2 || true
     exit 1
