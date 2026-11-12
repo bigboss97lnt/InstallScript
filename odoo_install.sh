@@ -31,14 +31,14 @@ IS_ENTERPRISE="False"
 # Installs postgreSQL V14 instead of defaults (e.g V12 for Ubuntu 20/22) - this improves performance
 INSTALL_POSTGRESQL_FOURTEEN="True"
 # Set this to True if you want to install Nginx!
-INSTALL_NGINX="False"
+INSTALL_NGINX="True"
 # Set the superadmin password - if GENERATE_RANDOM_PASSWORD is set to "True" we will automatically generate a random password, otherwise we use this one
 OE_SUPERADMIN="admin"
 # Set to "True" to generate a random password, "False" to use the variable in OE_SUPERADMIN
 GENERATE_RANDOM_PASSWORD="True"
 OE_CONFIG="${OE_USER}-server"
 # Set the website name
-WEBSITE_NAME="_"
+WEBSITE_NAME="blob.advanced-sol.com"
 # Set the default Odoo longpolling port (you still have to use -c /etc/odoo-server.conf for example to use this.)
 LONGPOLLING_PORT="8072"
 # Set to "True" to install the supplied Cloudflare Origin Certificate.
@@ -49,17 +49,12 @@ CF_KEY_SOURCE="/root/private_key"
 NGINX_SSL_DIR="/etc/nginx/ssl/${WEBSITE_NAME}"
 CF_CERT_PATH="${NGINX_SSL_DIR}/origin.crt"
 CF_KEY_PATH="${NGINX_SSL_DIR}/origin.key"
-##
-###  WKHTMLTOPDF download links
-## === Ubuntu Trusty x64 & x32 === (for other distributions please replace these two links,
-## in order to have correct version of wkhtmltopdf installed, for a danger note refer to
-## https://github.com/odoo/odoo/wiki/Wkhtmltopdf ):
-## https://www.odoo.com/documentation/16.0/administration/install.html
-
+# Patched-Qt package for Ubuntu 22.04 (Jammy), amd64.
+# Ubuntu's unpatched wkhtmltopdf package is unsuitable for Odoo report headers.
 WKHTMLTOX_URL="https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-3/wkhtmltox_0.12.6.1-3.jammy_amd64.deb"
 
-if [[ "$(lsb_release -is)" != "Ubuntu" || "$(lsb_release -rs)" != "22.04" ]]; then
-    echo "ERROR: This installer targets Ubuntu 22.04 (Jammy)." >&2
+if [[ "$(lsb_release -is)" != "Ubuntu" || ! "$(lsb_release -rs)" =~ ^(22\.04|24\.04)$ ]]; then
+    echo "ERROR: This installer requires Ubuntu 22.04 or 24.04." >&2
     exit 1
 fi
 if [[ "$(dpkg --print-architecture)" != "amd64" ]]; then
@@ -113,6 +108,7 @@ sudo npm install -g rtlcss
 if [ $INSTALL_WKHTMLTOPDF = "True" ]; then
   echo -e "\n---- Install wkhtmltopdf 0.12.6.1 (patched Qt) ----"
   wget -q --show-progress "$WKHTMLTOX_URL" -O /tmp/wkhtmltox.deb
+  sudo apt-get --simulate install /tmp/wkhtmltox.deb
   sudo apt-get install -y /tmp/wkhtmltox.deb
   rm -f /tmp/wkhtmltox.deb
   wkhtmltopdf --version | grep -F "wkhtmltopdf 0.12.6.1 (with patched qt)"
@@ -137,6 +133,13 @@ sudo git clone --depth 1 --branch $OE_VERSION https://github.com/odoo/odoo $OE_H
 
 echo -e "\n---- Install Odoo Python requirements in an isolated environment ----"
 sudo python3 -m venv "$OE_HOME/venv"
+if "$OE_HOME/venv/bin/python" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)'; then
+    # Python 3.12 removed pkgutil.ImpImporter; setuptools<66 cannot load.
+    # Odoo 16 still imports pkg_resources, so setuptools must stay below 81.
+    sudo "$OE_HOME/venv/bin/python" -m pip install --upgrade pip "setuptools>=68,<81" wheel
+    # Let Odoo's markers select gevent/greenlet compatible with Python 3.12.
+    sudo "$OE_HOME/venv/bin/python" -m pip install -r "$OE_HOME_EXT/requirements.txt"
+else
 sudo "$OE_HOME/venv/bin/pip" install --upgrade "pip<24.1" "setuptools<66" wheel "Cython<3"
 # gevent 21.8.0 fails when its isolated build environment pulls Cython 3.
 sudo "$OE_HOME/venv/bin/pip" install "gevent==21.8.0" --no-build-isolation
@@ -144,6 +147,8 @@ REQUIREMENTS_WITHOUT_GEVENT=$(mktemp)
 grep -vE '^[[:space:]]*gevent([=<>!~]|[[:space:]])' "$OE_HOME_EXT/requirements.txt" > "$REQUIREMENTS_WITHOUT_GEVENT"
 sudo "$OE_HOME/venv/bin/pip" install -r "$REQUIREMENTS_WITHOUT_GEVENT"
 rm -f "$REQUIREMENTS_WITHOUT_GEVENT"
+fi
+sudo "$OE_HOME/venv/bin/python" -m pip check
 sudo chown -R "$OE_USER:$OE_USER" "$OE_HOME/venv"
 
 if [ $IS_ENTERPRISE = "True" ]; then
@@ -190,10 +195,15 @@ if [ $GENERATE_RANDOM_PASSWORD = "True" ]; then
     OE_SUPERADMIN=$(openssl rand -hex 8)
 fi
 sudo su root -c "printf 'admin_passwd = ${OE_SUPERADMIN}\n' >> /etc/${OE_CONFIG}.conf"
-if [ $OE_VERSION > "11.0" ];then
+if [[ "${OE_VERSION%%.*}" -gt 11 ]]; then
     sudo su root -c "printf 'http_port = ${OE_PORT}\n' >> /etc/${OE_CONFIG}.conf"
 else
     sudo su root -c "printf 'xmlrpc_port = ${OE_PORT}\n' >> /etc/${OE_CONFIG}.conf"
+fi
+sudo su root -c "printf 'http_interface = 127.0.0.1\n' >> /etc/${OE_CONFIG}.conf"
+if [ "$INSTALL_NGINX" = "True" ]; then
+    # Prefork mode starts the separate gevent service used by /websocket.
+    sudo su root -c "printf 'workers = 2\ngevent_port = ${LONGPOLLING_PORT}\n' >> /etc/${OE_CONFIG}.conf"
 fi
 sudo su root -c "printf 'logfile = /var/log/${OE_USER}/${OE_CONFIG}.log\n' >> /etc/${OE_CONFIG}.conf"
 
@@ -387,8 +397,18 @@ server {
     proxy_redirect off;
   }
 
-  location /longpolling {
+  location ^~ /websocket {
     proxy_pass http://127.0.0.1:$LONGPOLLING_PORT;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection "upgrade";
+    # Defining headers here replaces the server-level proxy_set_header list.
+    proxy_set_header X-Forwarded-Host \$host;
+    proxy_set_header X-Forwarded-For \$remote_addr;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Client-IP \$remote_addr;
+    proxy_buffering off;
   }
 
   location ~* .(js|css|png|jpg|jpeg|gif|ico)$ {
@@ -430,7 +450,26 @@ else
 fi
 
 echo -e "* Starting Odoo Service"
-sudo su root -c "/etc/init.d/$OE_CONFIG start"
+# Catch import/dependency failures before backgrounding the service.
+sudo -H -u "$OE_USER" bash -c 'cd "$1" && "$2" -c "import odoo"' _ "$OE_HOME_EXT" "$OE_HOME/venv/bin/python"
+sudo systemctl daemon-reload
+sudo systemctl start "$OE_CONFIG"
+
+# The legacy init script can return success even if Python immediately exits.
+ODOO_READY="False"
+for attempt in {1..30}; do
+    if curl --noproxy '*' --fail --silent --output /dev/null --max-time 2 "http://127.0.0.1:${OE_PORT}/web/login"; then
+        ODOO_READY="True"
+        break
+    fi
+    sleep 2
+done
+if [ "$ODOO_READY" != "True" ]; then
+    echo "ERROR: Odoo did not respond on 127.0.0.1:${OE_PORT}." >&2
+    sudo systemctl status "$OE_CONFIG" --no-pager -l >&2 || true
+    sudo tail -n 60 "/var/log/${OE_USER}/${OE_CONFIG}.log" >&2 || true
+    exit 1
+fi
 echo "-----------------------------------------------------------"
 echo "Done! The Odoo server is up and running. Specifications:"
 echo "Port: $OE_PORT"
